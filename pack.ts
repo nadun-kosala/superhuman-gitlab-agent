@@ -15,8 +15,18 @@ pack.setUserAuthentication({
   scopes: ["api", "read_user", "read_repository", "write_repository"],
   requiresEndpointUrl: false,
   getConnectionName: async context => {
-    const user = await gitlabFetch(context, { method: "GET", path: "/user" });
-    return user?.username || user?.name || user?.email || "GitLab User";
+    // Keep this call lightweight and failure-tolerant so OAuth sign-in
+    // does not fail due to account-name lookup edge cases.
+    try {
+      const response = await context.fetcher.fetch({
+        method: "GET",
+        url: `${API_BASE}/user`,
+      });
+      const user = response.body || {};
+      return user.username || user.name || user.email || "GitLab User";
+    } catch (_error) {
+      return "GitLab User";
+    }
   },
 });
 
@@ -47,6 +57,21 @@ function encodeProjectId(id: string | number): string {
   return encodeURIComponent(String(id));
 }
 
+function buildApiUrl(
+  path: string,
+  queryParams?: Record<string, string | number | boolean | undefined>,
+): string {
+  const pairs: string[] = [];
+  for (const [key, value] of Object.entries(queryParams || {})) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  }
+  const query = pairs.length ? `?${pairs.join("&")}` : "";
+  return `${API_BASE}${asPath(path)}${query}`;
+}
+
 async function gitlabFetch(
   context: GitlabContext,
   options: {
@@ -56,15 +81,10 @@ async function gitlabFetch(
     body?: unknown;
   },
 ): Promise<any> {
-  const url = new URL(`${API_BASE}${asPath(options.path)}`);
-  for (const [key, value] of Object.entries(options.queryParams || {})) {
-    if (value !== undefined && value !== null) {
-      url.searchParams.set(key, String(value));
-    }
-  }
+  const url = buildApiUrl(options.path, options.queryParams);
   const response = await context.fetcher.fetch({
     method: options.method,
-    url: url.toString(),
+    url,
     body: options.body ? JSON.stringify(options.body) : undefined,
     headers: { "Content-Type": "application/json" },
   });
@@ -110,17 +130,14 @@ async function fetchAllPages(
 ): Promise<{ items: any[]; continuation?: { page: number } }> {
   const page = Number((context.sync.continuation as any)?.page ?? 1);
   const perPage = 50;
-  const url = new URL(`${API_BASE}${asPath(options.path)}`);
-  for (const [key, value] of Object.entries(options.queryParams || {})) {
-    if (value !== undefined && value !== null) {
-      url.searchParams.set(key, String(value));
-    }
-  }
-  url.searchParams.set("page", String(page));
-  url.searchParams.set("per_page", String(perPage));
+  const url = buildApiUrl(options.path, {
+    ...options.queryParams,
+    page,
+    per_page: perPage,
+  });
   const response = await context.fetcher.fetch({
     method: "GET",
-    url: url.toString(),
+    url,
   });
 
   if (response.status < 200 || response.status >= 300) {
