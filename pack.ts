@@ -911,9 +911,12 @@ pack.addSyncTable({
 const superhumanPrompt = [
   "You are GitLabSuperhuman, an elite software workflow assistant for GitLab.",
   "Always translate GitHub terms to GitLab terms (e.g., Pull Requests -> Merge Requests, Actions -> CI/CD Pipelines).",
+  "You DO have access to GitLab via Pack tools; do not claim lack of direct access.",
+  "When the user asks for live GitLab data, call a relevant tool first before answering.",
   "Before suggesting merges, always check MR status including pipeline/check status, conflicts, approvals/reviewers, and mergeability.",
   "When asked to review what changed, call GetMRDiff and summarize technical code changes in concise bullet points.",
   "For issue triage, group issues by feature and priority, suggest labels, and propose assignees based on available project context.",
+  "If user intent is ambiguous, ask one clarifying question; otherwise act immediately using tools.",
   "Prefer explicit, verifiable actions and list any blockers clearly.",
 ].join("\n");
 
@@ -940,6 +943,25 @@ Available tools:
 // Guarded for SDKs that expose addSkill / agent registration.
 const maybeSkillPack = pack as any;
 if (typeof maybeSkillPack.addSkill === "function") {
+  // Chat skill controls initial routing behavior and available default tools.
+  if (typeof maybeSkillPack.setChatSkill === "function") {
+    maybeSkillPack.setChatSkill({
+      name: "GitLabChatRouter",
+      displayName: "GitLab Chat Router",
+      description: "Routes user requests to GitLab data retrieval, review, and update workflows.",
+      prompt: [
+        "You are the GitLabSuperhuman chat router.",
+        "Never say you lack direct access; you must use Pack tools for live GitLab data.",
+        "For requests like 'list projects', 'show issues', 'show MRs', first call a Pack tool and then summarize results.",
+        "Translate GitHub terms to GitLab terms in all responses.",
+        "If request is a write action, confirm intent briefly then execute with the appropriate tool.",
+      ].join("\n"),
+      tools: [
+        { type: coda.ToolType.Pack },
+      ],
+    });
+  }
+
   maybeSkillPack.addSkill({
     name: "GitLabSuperhuman",
     displayName: "GitLabSuperhuman",
@@ -958,6 +980,48 @@ if (typeof maybeSkillPack.addSkill === "function") {
           { formulaName: "CreateCommit" },
         ],
       },
+    ],
+  });
+
+  maybeSkillPack.addSkill({
+    name: "ProjectDiscovery",
+    displayName: "Project discovery",
+    description: "Lists and summarizes GitLab projects, including filtering and prioritization by recent activity.",
+    prompt: [
+      "When user asks to list or find projects, use Pack tools to fetch project data first.",
+      "Return concise bullets with project name/path, visibility, default branch, and recent activity.",
+      "Suggest next actions such as inspecting MRs or issues for selected projects.",
+    ].join("\n"),
+    tools: [
+      { type: coda.ToolType.Pack },
+    ],
+  });
+
+  maybeSkillPack.addSkill({
+    name: "MergeRequestReviewer",
+    displayName: "Merge request reviewer",
+    description: "Reviews and summarizes merge requests, including diffs and merge readiness.",
+    prompt: [
+      "For 'review what changed' requests, call GetMRDiff and summarize technical changes into readable bullets.",
+      "Check merge readiness: conflicts, approval state, and pipeline/check status before merge recommendations.",
+      "Use GitLab terminology (Merge Request, pipeline) even if user says Pull Request/Actions.",
+    ].join("\n"),
+    tools: [
+      { type: coda.ToolType.Pack },
+    ],
+  });
+
+  maybeSkillPack.addSkill({
+    name: "IssueTriagePlanner",
+    displayName: "Issue triage planner",
+    description: "Groups issues by feature and priority, suggests labels, and proposes assignees.",
+    prompt: [
+      "Fetch issues using Pack tools before triage recommendations.",
+      "Group by feature/theme and priority; propose actionable labels and likely assignees.",
+      "If information is missing, ask one focused follow-up question.",
+    ].join("\n"),
+    tools: [
+      { type: coda.ToolType.Pack },
     ],
   });
 }
