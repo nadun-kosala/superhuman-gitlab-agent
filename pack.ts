@@ -160,6 +160,25 @@ async function fetchAllPages(
   return { items, continuation };
 }
 
+function normalizeMergeRequestScope(scope?: string): "assigned_to_me" | "created_by_me" {
+  return scope === "created_by_me" ? "created_by_me" : "assigned_to_me";
+}
+
+const ChatToolFormulas = [
+  { formulaName: "ListProjects" },
+  { formulaName: "ListMergeRequests" },
+  { formulaName: "ListIssues" },
+  { formulaName: "ListUsers" },
+  { formulaName: "ListGroups" },
+  { formulaName: "UpdateMergeRequest" },
+  { formulaName: "PostMRComment" },
+  { formulaName: "GetMRDiff" },
+  { formulaName: "CreateIssue" },
+  { formulaName: "UpdateIssue" },
+  { formulaName: "CreateBranch" },
+  { formulaName: "CreateCommit" },
+];
+
 function mapUser(user: any): any {
   if (!user) {
     return undefined;
@@ -381,6 +400,243 @@ const FileRef = coda.makeReferenceSchemaFromObjectSchema(FileSchema, "Repository
 // -----------------------------------------------------------------------------
 // Action formulas / tools
 // -----------------------------------------------------------------------------
+const ListProjects = pack.addFormula({
+  name: "ListProjects",
+  description: "List projects the authenticated user is a member of.",
+  connectionRequirement: coda.ConnectionRequirement.Required,
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "search",
+      description: "Optional search term for project name/path.",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "limit",
+      description: "Max projects to return (1-50).",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async ([search, limit], context) => {
+    const cappedLimit = Math.max(1, Math.min(Number(limit || 20), 50));
+    const projects = await gitlabFetch(context, {
+      method: "GET",
+      path: "/projects",
+      queryParams: {
+        membership: true,
+        search: search || undefined,
+        order_by: "last_activity_at",
+        sort: "desc",
+        per_page: cappedLimit,
+      },
+    });
+    const mapped = (Array.isArray(projects) ? projects : []).map(mapProject);
+    return JSON.stringify(mapped);
+  },
+});
+
+const ListMergeRequests = pack.addFormula({
+  name: "ListMergeRequests",
+  description: "List merge requests scoped to the authenticated user.",
+  connectionRequirement: coda.ConnectionRequirement.Required,
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "scope",
+      description: "assigned_to_me (default) or created_by_me.",
+      optional: true,
+      autocomplete: ["assigned_to_me", "created_by_me"],
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "state",
+      description: "opened, merged, closed, or all.",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "limit",
+      description: "Max merge requests to return (1-50).",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async ([scope, state, limit], context) => {
+    const cappedLimit = Math.max(1, Math.min(Number(limit || 20), 50));
+    const mergeRequests = await gitlabFetch(context, {
+      method: "GET",
+      path: "/merge_requests",
+      queryParams: {
+        scope: normalizeMergeRequestScope(scope),
+        state: state || "all",
+        with_merge_status_recheck: true,
+        per_page: cappedLimit,
+      },
+    });
+    return JSON.stringify(Array.isArray(mergeRequests) ? mergeRequests : []);
+  },
+});
+
+const ListIssues = pack.addFormula({
+  name: "ListIssues",
+  description: "List issues assigned to the authenticated user.",
+  connectionRequirement: coda.ConnectionRequirement.Required,
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "state",
+      description: "opened, closed, or all.",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "labels",
+      description: "Optional comma-separated label filter.",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "limit",
+      description: "Max issues to return (1-50).",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async ([state, labels, limit], context) => {
+    const cappedLimit = Math.max(1, Math.min(Number(limit || 20), 50));
+    const issues = await gitlabFetch(context, {
+      method: "GET",
+      path: "/issues",
+      queryParams: {
+        scope: "assigned_to_me",
+        state: state || "all",
+        labels: labels || undefined,
+        per_page: cappedLimit,
+      },
+    });
+    return JSON.stringify(Array.isArray(issues) ? issues : []);
+  },
+});
+
+const ListUsers = pack.addFormula({
+  name: "ListUsers",
+  description: "List users from the authenticated user's projects/groups context.",
+  connectionRequirement: coda.ConnectionRequirement.Required,
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "search",
+      description: "Optional user search query.",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "limit",
+      description: "Max users to return after dedupe (1-200).",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async ([search, limit], context) => {
+    const cappedLimit = Math.max(1, Math.min(Number(limit || 100), 200));
+    const usersById = new Map<string, any>();
+    const addUser = (user: any) => {
+      const mapped = mapUser(user);
+      if (mapped?.id && !usersById.has(mapped.id)) {
+        usersById.set(mapped.id, mapped);
+      }
+    };
+
+    addUser(await gitlabFetch(context, { method: "GET", path: "/user" }));
+    const projects = await gitlabFetch(context, {
+      method: "GET",
+      path: "/projects",
+      queryParams: {
+        membership: true,
+        order_by: "last_activity_at",
+        sort: "desc",
+        per_page: 20,
+      },
+    });
+    for (const project of Array.isArray(projects) ? projects : []) {
+      const members = await gitlabFetch(context, {
+        method: "GET",
+        path: `/projects/${encodeProjectId(project.id)}/members/all`,
+        queryParams: {
+          query: search || undefined,
+          per_page: 100,
+        },
+      });
+      for (const member of Array.isArray(members) ? members : []) {
+        addUser(member);
+      }
+      if (usersById.size >= cappedLimit) {
+        break;
+      }
+    }
+
+    const groups = await gitlabFetch(context, {
+      method: "GET",
+      path: "/groups",
+      queryParams: { per_page: 20 },
+    });
+    for (const group of Array.isArray(groups) ? groups : []) {
+      const members = await gitlabFetch(context, {
+        method: "GET",
+        path: `/groups/${encodeProjectId(group.id)}/members`,
+        queryParams: {
+          query: search || undefined,
+          per_page: 100,
+        },
+      });
+      for (const member of Array.isArray(members) ? members : []) {
+        addUser(member);
+      }
+      if (usersById.size >= cappedLimit) {
+        break;
+      }
+    }
+
+    return JSON.stringify(Array.from(usersById.values()).slice(0, cappedLimit));
+  },
+});
+
+const ListGroups = pack.addFormula({
+  name: "ListGroups",
+  description: "List groups the authenticated user can access.",
+  connectionRequirement: coda.ConnectionRequirement.Required,
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "search",
+      description: "Optional group search term.",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "limit",
+      description: "Max groups to return (1-50).",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async ([search, limit], context) => {
+    const cappedLimit = Math.max(1, Math.min(Number(limit || 20), 50));
+    const groups = await gitlabFetch(context, {
+      method: "GET",
+      path: "/groups",
+      queryParams: {
+        search: search || undefined,
+        all_available: false,
+        per_page: cappedLimit,
+      },
+    });
+    return JSON.stringify(Array.isArray(groups) ? groups : []);
+  },
+});
+
 const UpdateMergeRequest = pack.addFormula({
   name: "UpdateMergeRequest",
   description: "Approve, close, or merge a GitLab merge request.",
@@ -623,7 +879,7 @@ const CreateCommit = pack.addFormula({
 // -----------------------------------------------------------------------------
 pack.addSyncTable({
   name: "MergeRequests",
-  description: "Sync merge requests across accessible GitLab projects.",
+  description: "Sync merge requests scoped to the authenticated user.",
   identityName: "MergeRequest",
   schema: MergeRequestSchema,
   formula: {
@@ -631,14 +887,21 @@ pack.addSyncTable({
     description: "Sync merge requests.",
     parameters: [
       coda.makeParameter({ type: coda.ParameterType.String, name: "state", description: "opened, merged, closed, all", optional: true }),
-      coda.makeParameter({ type: coda.ParameterType.String, name: "scope", description: "created_by_me, assigned_to_me, all", optional: true }),
+      coda.makeParameter({
+        type: coda.ParameterType.String,
+        name: "scope",
+        description: "User scope: assigned_to_me (default) or created_by_me.",
+        optional: true,
+        autocomplete: ["assigned_to_me", "created_by_me"],
+      }),
     ],
     execute: async ([state, scope], context) => {
+      const effectiveScope = normalizeMergeRequestScope(scope);
       const { items, continuation } = await fetchAllPages(context, {
         path: "/merge_requests",
         queryParams: {
           state: state || "all",
-          scope: scope || "all",
+          scope: effectiveScope,
           with_merge_status_recheck: true,
         },
       });
@@ -855,7 +1118,7 @@ pack.addSyncTable({
 
 pack.addSyncTable({
   name: "Users",
-  description: "Sync accessible GitLab users.",
+  description: "Sync users from the authenticated account's projects and groups.",
   identityName: "User",
   schema: UserSchema,
   formula: {
@@ -865,11 +1128,61 @@ pack.addSyncTable({
       coda.makeParameter({ type: coda.ParameterType.String, name: "search", description: "Search users.", optional: true }),
     ],
     execute: async ([search], context) => {
-      const { items, continuation } = await fetchAllPages(context, {
-        path: "/users",
+      const { items: projects, continuation } = await fetchAllPages(context, {
+        path: "/projects",
+        queryParams: {
+          membership: true,
+          order_by: "last_activity_at",
+          sort: "desc",
+        },
+      });
+
+      const userById = new Map<string, any>();
+      const addUser = (user: any) => {
+        const mapped = mapUser(user);
+        if (mapped?.id) {
+          userById.set(mapped.id, mapped);
+        }
+      };
+
+      // Include the authenticated user first to guarantee at least one scoped user.
+      const me = await gitlabFetch(context, { method: "GET", path: "/user" });
+      addUser(me);
+
+      for (const project of projects) {
+        const projectId = encodeProjectId(project.id);
+        const members = await gitlabFetch(context, {
+          method: "GET",
+          path: `/projects/${projectId}/members/all`,
+          queryParams: {
+            per_page: 100,
+            query: search || undefined,
+          },
+        });
+        for (const member of Array.isArray(members) ? members : []) {
+          addUser(member);
+        }
+      }
+
+      const { items: groups } = await fetchAllPages(context, {
+        path: "/groups",
         queryParams: { search: search || undefined },
       });
-      return { result: items.map(mapUser) as any[], continuation };
+      for (const group of groups) {
+        const members = await gitlabFetch(context, {
+          method: "GET",
+          path: `/groups/${encodeProjectId(group.id)}/members`,
+          queryParams: {
+            per_page: 100,
+            query: search || undefined,
+          },
+        });
+        for (const member of Array.isArray(members) ? members : []) {
+          addUser(member);
+        }
+      }
+
+      return { result: Array.from(userById.values()), continuation };
     },
   },
 });
@@ -912,6 +1225,14 @@ const superhumanPrompt = [
   "You are GitLabSuperhuman, an elite software workflow assistant for GitLab.",
   "Always translate GitHub terms to GitLab terms (e.g., Pull Requests -> Merge Requests, Actions -> CI/CD Pipelines).",
   "You DO have access to GitLab via Pack tools; do not claim lack of direct access.",
+  "You HAVE access to GitLab via the provided tools.",
+  "When the user asks about merge requests, you MUST call SyncMergeRequests or GetMRDiff before answering.",
+  "When the user asks about projects, you MUST call SyncProjects before answering.",
+  "When the user asks about issues, you MUST call SyncIssues before answering.",
+  "When the user asks about users or assignees, you MUST call SyncUsers before answering.",
+  "When the user asks to update merge requests, you MUST use UpdateMergeRequest or PostMRComment.",
+  "When the user asks to create or update issues, you MUST use CreateIssue or UpdateIssue.",
+  "When the user asks for repository changes, branches, or commits, you MUST use CreateBranch or CreateCommit.",
   "When the user asks for live GitLab data, call a relevant tool first before answering.",
   "Before suggesting merges, always check MR status including pipeline/check status, conflicts, approvals/reviewers, and mergeability.",
   "When asked to review what changed, call GetMRDiff and summarize technical code changes in concise bullet points.",
@@ -930,6 +1251,11 @@ pack.addFormula({
     return `${superhumanPrompt}
 
 Available tools:
+- ListProjects
+- ListMergeRequests
+- ListIssues
+- ListUsers
+- ListGroups
 - UpdateMergeRequest
 - PostMRComment
 - GetMRDiff
@@ -952,12 +1278,19 @@ if (typeof maybeSkillPack.addSkill === "function") {
       prompt: [
         "You are the GitLabSuperhuman chat router.",
         "Never say you lack direct access; you must use Pack tools for live GitLab data.",
-        "For requests like 'list projects', 'show issues', 'show MRs', first call a Pack tool and then summarize results.",
+        "You HAVE access to GitLab via the provided tools.",
+        "For requests like 'list projects', 'show issues', 'show MRs', you MUST call ListProjects, ListIssues, or ListMergeRequests first, then summarize.",
+        "For MR review requests, you MUST call GetMRDiff.",
+        "For user/assignee requests, you MUST call ListUsers.",
+        "For write requests, you MUST use the matching action formula and never claim missing access.",
         "Translate GitHub terms to GitLab terms in all responses.",
         "If request is a write action, confirm intent briefly then execute with the appropriate tool.",
       ].join("\n"),
       tools: [
-        { type: coda.ToolType.Pack },
+        {
+          type: coda.ToolType.Pack,
+          formulas: ChatToolFormulas,
+        },
       ],
     });
   }
@@ -970,15 +1303,7 @@ if (typeof maybeSkillPack.addSkill === "function") {
     tools: [
       {
         type: coda.ToolType.Pack,
-        formulas: [
-          { formulaName: "UpdateMergeRequest" },
-          { formulaName: "PostMRComment" },
-          { formulaName: "GetMRDiff" },
-          { formulaName: "CreateIssue" },
-          { formulaName: "UpdateIssue" },
-          { formulaName: "CreateBranch" },
-          { formulaName: "CreateCommit" },
-        ],
+        formulas: ChatToolFormulas,
       },
     ],
   });
@@ -988,12 +1313,15 @@ if (typeof maybeSkillPack.addSkill === "function") {
     displayName: "Project discovery",
     description: "Lists and summarizes GitLab projects, including filtering and prioritization by recent activity.",
     prompt: [
-      "When user asks to list or find projects, use Pack tools to fetch project data first.",
+      "When user asks to list or find projects, you MUST call ListProjects first.",
       "Return concise bullets with project name/path, visibility, default branch, and recent activity.",
       "Suggest next actions such as inspecting MRs or issues for selected projects.",
     ].join("\n"),
     tools: [
-      { type: coda.ToolType.Pack },
+      {
+        type: coda.ToolType.Pack,
+        formulas: ChatToolFormulas,
+      },
     ],
   });
 
@@ -1002,12 +1330,16 @@ if (typeof maybeSkillPack.addSkill === "function") {
     displayName: "Merge request reviewer",
     description: "Reviews and summarizes merge requests, including diffs and merge readiness.",
     prompt: [
-      "For 'review what changed' requests, call GetMRDiff and summarize technical changes into readable bullets.",
+      "For 'review what changed' requests, you MUST call GetMRDiff and summarize technical changes into readable bullets.",
+      "For MR lists/status queries, you MUST call ListMergeRequests before recommendations.",
       "Check merge readiness: conflicts, approval state, and pipeline/check status before merge recommendations.",
       "Use GitLab terminology (Merge Request, pipeline) even if user says Pull Request/Actions.",
     ].join("\n"),
     tools: [
-      { type: coda.ToolType.Pack },
+      {
+        type: coda.ToolType.Pack,
+        formulas: ChatToolFormulas,
+      },
     ],
   });
 
@@ -1016,12 +1348,16 @@ if (typeof maybeSkillPack.addSkill === "function") {
     displayName: "Issue triage planner",
     description: "Groups issues by feature and priority, suggests labels, and proposes assignees.",
     prompt: [
-      "Fetch issues using Pack tools before triage recommendations.",
+      "You MUST call ListIssues before triage recommendations.",
+      "If assignees/users are needed, you MUST call ListUsers.",
       "Group by feature/theme and priority; propose actionable labels and likely assignees.",
       "If information is missing, ask one focused follow-up question.",
     ].join("\n"),
     tools: [
-      { type: coda.ToolType.Pack },
+      {
+        type: coda.ToolType.Pack,
+        formulas: ChatToolFormulas,
+      },
     ],
   });
 }
