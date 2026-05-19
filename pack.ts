@@ -177,6 +177,7 @@ const ChatToolFormulas = [
   { formulaName: "UpdateIssue" },
   { formulaName: "CreateBranch" },
   { formulaName: "CreateCommit" },
+  { formulaName: "CreateMergeRequest" },
 ];
 
 function mapUser(user: any): any {
@@ -874,6 +875,52 @@ const CreateCommit = pack.addFormula({
   },
 });
 
+const CreateMergeRequest = pack.addFormula({
+  name: "CreateMergeRequest",
+  description: "Create a Merge Request (MR) from a source branch into a target branch.",
+  isAction: true,
+  connectionRequirement: coda.ConnectionRequirement.Required,
+  // Required parameters first, optional parameters last
+  parameters: [
+    coda.makeParameter({ type: coda.ParameterType.String, name: "projectIdOrPath", description: "Project ID/path." }),
+    coda.makeParameter({ type: coda.ParameterType.String, name: "sourceBranch", description: "Source branch name." }),
+    coda.makeParameter({ type: coda.ParameterType.String, name: "title", description: "Merge request title." }),
+    coda.makeParameter({ type: coda.ParameterType.String, name: "targetBranch", description: "Target branch name (e.g. main).", optional: true }),
+    coda.makeParameter({ type: coda.ParameterType.String, name: "description", description: "Merge request description.", optional: true }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async ([projectIdOrPath, sourceBranch, title, targetBranch, description], context) => {
+    const project = encodeProjectId(projectIdOrPath);
+
+    // If targetBranch not provided, attempt to fetch project and use its defaultBranch
+    let effectiveTarget = targetBranch;
+    if (!effectiveTarget) {
+      try {
+        const projectInfo = await gitlabFetch(context, { method: "GET", path: `/projects/${project}` });
+        effectiveTarget = projectInfo?.default_branch || "main";
+      } catch (e) {
+        // If we cannot determine default branch, ask user to specify by throwing a clear error
+        throw new coda.UserVisibleError(
+          "Target branch not specified and default branch could not be determined. Please provide a targetBranch.",
+        );
+      }
+    }
+
+    const mr = await gitlabFetch(context, {
+      method: "POST",
+      path: `/projects/${project}/merge_requests`,
+      body: {
+        source_branch: sourceBranch,
+        target_branch: effectiveTarget,
+        title,
+        description: description || undefined,
+      },
+    });
+
+    return `Created Merge Request: ${title} (from ${sourceBranch} to ${effectiveTarget})`;
+  },
+});
+
 // -----------------------------------------------------------------------------
 // Sync tables
 // -----------------------------------------------------------------------------
@@ -1236,6 +1283,7 @@ const superhumanPrompt = [
   
   "### 3. TOOL EXECUTION PROTOCOLS",
   "- When the user asks about merge requests, you MUST call SyncMergeRequests or GetMRDiff before answering.",
+  "- When the user asks to create, open, or initiate a merge request or pull request for a branch, you MUST use the CreateMergeRequest tool.",
   "- When the user asks about projects, you MUST call SyncProjects before answering.",
   "- When the user asks about issues, you MUST call SyncIssues before answering.",
   "- When the user asks about users or assignees, you MUST call SyncUsers before answering.",
@@ -1249,6 +1297,7 @@ const superhumanPrompt = [
   "- When asked to review what changed, call GetMRDiff and summarize technical code changes in concise bullet points.",
   "- For issue triage, group issues by feature and priority, suggest labels, and propose assignees based on available project context.",
   "- If user intent is ambiguous, ask ONE clarifying question; otherwise act immediately using tools.",
+  "- When creating a Merge Request, if the target branch is not specified by the user, look up the project details using ListProjects to find the project's 'defaultBranch' and use that as the target branch automatically. If the user context is completely ambiguous about branches, ask for clarification before executing.",
   "- Prefer explicit, verifiable actions and list any blockers clearly."
 ].join("\n");
 
@@ -1259,7 +1308,7 @@ pack.addFormula({
   parameters: [],
   resultType: coda.ValueType.String,
   execute: async () => {
-    return `${superhumanPrompt}
+  return `${superhumanPrompt}
 
 Available tools:
 - ListProjects
@@ -1273,7 +1322,8 @@ Available tools:
 - CreateIssue
 - UpdateIssue
 - CreateBranch
-- CreateCommit`;
+- CreateCommit
+- CreateMergeRequest`;
   },
 });
 
@@ -1338,13 +1388,14 @@ if (typeof maybeSkillPack.addSkill === "function") {
 
   maybeSkillPack.addSkill({
     name: "MergeRequestReviewer",
-    displayName: "Merge request reviewer",
-    description: "Reviews and summarizes merge requests, including diffs and merge readiness.",
+    displayName: "Merge Request Manager",
+    description: "Reviews, summarizes, and creates merge requests, including diffs, branch management, and merge readiness.",
     prompt: [
       "For 'review what changed' requests, you MUST call GetMRDiff and summarize technical changes into readable bullets.",
       "For MR lists/status queries, you MUST call ListMergeRequests before recommendations.",
       "Check merge readiness: conflicts, approval state, and pipeline/check status before merge recommendations.",
       "Use GitLab terminology (Merge Request, pipeline) even if user says Pull Request/Actions.",
+      "For requests to open or create an MR from a branch, identify the source branch and project path, resolve the default branch if needed, and execute CreateMergeRequest.",
     ].join("\n"),
     tools: [
       {
